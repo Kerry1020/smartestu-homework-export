@@ -17,10 +17,10 @@ For this site, API-first beats browser-first. Use browser automation for visual 
 
 Do not use this skill for generic LMS scraping where the site and payloads are unknown.
 
-## Credentials
-- Password is stored in macOS Keychain: `security find-generic-password -a "<student_local_id>" -s "smartestu.cn" -w`
-- If keychain lookup fails (needs user approval), ask the user for password once, then store it: `security add-generic-password -a "<student_local_id>" -s "smartestu.cn" -w "<password>"`
-- Known config: school_code=`heu` (Harbin Engineering University), student_local_id=`2025089104`
+## Privacy and Safety
+- This repository contains no live credentials, tokens, or session data.
+- Any identifiers shown in examples must be fictional placeholders.
+- Credentials should only be used for the current login session.
 - Do not echo passwords or tokens into chat logs, issues, screenshots, or repository files.
 
 ## Core Workflow
@@ -34,6 +34,26 @@ Match the school entry first.
 Example placeholder form:
 - `name = "<school_name>"`
 - `code = "<school_code>"`
+
+### 1.1 Verify response shape before parsing
+Do not assume endpoint response structure from memory, older notes, or nearby APIs.
+
+Hard requirements:
+- before writing parsing logic for a Smartestu endpoint, inspect a real response sample from that exact endpoint
+- record whether the top-level payload is an object, array, or nested `data` wrapper
+- do not assume `/api/schools` returns a bare array; verify whether it is `{ "schools": [...] }` or another wrapper in the current environment
+- do not reuse parsing assumptions from login or homework endpoints for school-list endpoints
+- when a response shape is uncertain, print or inspect the first layer of keys before iterating fields
+
+Failure pattern to avoid:
+- writing `for item in response` before confirming whether `response` is the array itself or an object containing the array
+- treating a successful `200` response as proof that parsing assumptions are correct
+- “the endpoint exists” and “the parser is correct” are separate checks
+
+Recommended guardrail:
+- first validate the shape
+- then extract the correct collection field
+- only then search/match school entries or flatten homework arrays
 
 ### 2. Log in with the real payload shape
 Use:
@@ -72,35 +92,68 @@ Critical detail:
 - this API expects the school-style `schoolUserId` string
 - the internal Mongo-style `_id` is the wrong identifier here
 
-### 4. Pick unsubmitted homework (ALL of them)
+### 4. Pick the latest unsubmitted homework
 Flatten:
 - `data.courseHomeworkDTOList[].studentCourseHomeworkDTOList[]`
 
 Then filter and sort:
-- keep `submission_status == "not_submitted"` (also check `status == 0` as backup)
+- keep `submission_status == "not_submitted"`
 - sort by `endTime` descending
-- **Return ALL unsubmitted items, not just the latest one**
-- If no unsubmitted found, explicitly report "0 unsubmitted across N courses" so the user can verify
+- choose the newest item
 
-Important: the API may only return courses that have homework assigned. If the user expects a course that doesn't appear, that course may not be on this platform or may have no homework yet. Report the full course list so the user can spot gaps.
-
-### 5. Extract questions (with sub-questions)
+### 5. Extract questions in display order
 Use the homework object directly:
-- `exercises[]` → each exercise has `questions[]` and optionally `questionStructure[]`
+- `exercises[]`
+- `exercises[].questions[]`
 
 Recommended order:
 1. iterate `exercises` in array order
-2. For each exercise, check `questionStructure[]` first:
-   - `questionStructure[].mainQuestion.questionMd` = main question text
-   - `questionStructure[].subQuestions[]` = sub-parts with their own `questionMd`
-3. Fallback: `questions[].content` if questionStructure is empty
-4. If both empty, fall back to `exercise.name`
+2. iterate each `questions[]` in array order
+3. join `question.content`
+4. if question content is empty, fall back to the exercise title or name
 
 Useful fields:
-- `exercise.questionNum`, `exercise.name`, `exercise.score`
-- `exercise.questions[].content`, `exercise.questions[].type`
-- `questionStructure[].mainQuestion.questionMd` (preferred for rendering)
-- `questionStructure[].subQuestions[].questionMd`
+- `exercise.questionNum`
+- `exercise.name`
+- `exercise.questions[].content`
+- `exercise.questions[].type`
+
+### 5.1 Preserve structure, not just text
+Do not flatten structured question content into plain text if structure carries meaning.
+
+Required handling:
+- preserve Markdown tables as real HTML tables before PDF export
+- preserve explicit line breaks, list structure, and simple inline HTML such as `<br>` when present in source content
+- if multiple tables appear in one question, render all of them
+- if a structure cannot be rendered faithfully, treat the export as incomplete instead of silently degrading it to paragraph text
+
+Structural verification targets:
+- tabular content in source should become visible table elements in the rendered HTML/PDF
+- probability/distribution tables must remain readable row/column layouts
+- the output should read like the original homework handout, not a text dump with `|` separators
+
+### 5.2 Anti-silent-degradation rules
+These rules exist to stop “looks good enough” exports.
+
+Hard requirements:
+- source structure decides output structure; if the source contains tables, the final output must contain tables
+- do not confuse math rendering success with overall render success; formulas can pass while tables still fail
+- do not treat plain-text preservation as acceptable when the original layout carries semantic meaning
+- do not claim success just because the PDF opens, has pages, or contains all characters
+- do not silently ship a degraded file and explain the limitation afterward; detect the degradation first and continue fixing
+
+Required source scan before export:
+- inspect representative `question.content` samples, not just homework metadata
+- explicitly check whether content contains Markdown tables, repeated `|`-delimited rows, `<br>`, list markers, or other structure-sensitive patterns
+- if any such pattern appears in source, add a matching render step and a matching verification step before generating the final PDF
+
+### 5.3 Failure gates for structured content
+Treat any of the following as an export failure, not a cosmetic issue:
+- raw Markdown table separators such as `|---|`, `| --- |`, or repeated pipe rows remain visible in final presentation
+- a question that should contain a table is rendered as a paragraph with pipes
+- line breaks collapse and change the meaning or readability of the problem
+- multiple tables in one question collapse into one block of text
+- inline HTML needed for meaning is escaped away instead of rendered safely
 
 ### 6. Preserve formulas with HTML + KaTeX
 Do not rely on screenshots if formulas matter.
@@ -119,12 +172,51 @@ Reliable render approach:
   - `renderMathInElement` exists
   - rendered `.katex` nodes are present
   - raw `$...$` is no longer visible in the rendered text
+  - when source contains tables, rendered `<table>` nodes are present in the final verified HTML
+  - raw Markdown table separators like `|---|` are no longer visible as the final presentation for those questions
 - never treat HTML generation or PDF generation alone as success
 - never claim the export is correct until the runtime checks above have passed
 - do not trust `file://` preview/export when external math assets are required unless runtime verification proves those assets actually loaded
 - if math stays as raw `$...$`, treat the export as failed and switch asset host, local asset strategy, or rendering path before continuing
+- if tables stay as raw Markdown, treat the export as failed and add a structure-aware rendering step before continuing
 - if you copy or move the verified HTML, re-check every relative asset path from the final delivery file location
 - the file you verify in the browser must be the same path you later export or send; a working sibling file does not prove the final deliverable works
+
+### 6.1 Verification checklist before sending
+Do not send the file until all applicable checks below pass.
+
+Minimum runtime checks:
+- `window.katex === true` or equivalent positive availability check
+- `renderMathInElement` exists
+- rendered `.katex` node count is greater than zero when formulas exist in source
+- rendered `<table>` node count is greater than zero when tables exist in source
+- raw `$...$` is not visible in final rendered text for formula-bearing questions
+- raw Markdown table separators are not the final visible presentation for table-bearing questions
+
+Minimum visual checks:
+- inspect at least one formula-heavy question
+- inspect at least one table-heavy question when tables exist
+- confirm table borders/cells are readable and row/column grouping still makes sense
+- confirm one-question-per-page layout did not cut tables into unreadable fragments
+
+Artifact checks:
+- regenerate the PDF after the last HTML fix
+- verify PDF timestamp/size changed after regeneration
+- send the exact file generated from the exact verified HTML path
+
+### 6.2 Explicit anti-stupidity reminders
+If you are tempted to say any of these, stop and keep fixing:
+- “公式都渲染了，应该差不多了”
+- “表格只是样式问题，不影响内容”
+- “PDF 能打开就算成功”
+- “用户如果发现表格有问题我再修”
+- “HTML 看起来差不多，先发再说”
+
+Reality:
+- formula pass does not imply structure pass
+- table loss is content loss, not just style loss
+- opening successfully is not correctness
+- post-send repair is failure, not acceptable default behavior
 
 ### 7. Export PDF
 Reliable local pattern:
@@ -164,15 +256,14 @@ If visual verification is needed:
 - Using browser scraping first when the API path is known
 - Sending only `studentId` without building `schoolUserId`
 - Using internal `_id` instead of the school-style student identifier
+- Assuming response shape from memory instead of checking the real top-level payload first
+- Treating a `200` response as if it proves the parser is correct
 - Picking the first unsubmitted homework instead of sorting by `endTime`
-- **Returning only the latest unsubmitted instead of ALL unsubmitted** — always report the full list
-- **Claiming "no unsubmitted" without showing the course list** — always show which courses were checked so the user can spot missing ones
 - Exporting raw text or screenshots and losing formulas
 - Repeating credentials in chat history
 - Verifying one HTML file and sending a different copied/moved file with broken relative asset paths
 - Fixing the HTML but forgetting to regenerate the PDF, then accidentally sending a stale older PDF
 - Claiming success from DOM/runtime checks alone without checking that the final delivered artifact was rebuilt from that verified state
-- **Forgetting sub-questions**: exercises with `questionStructure[].subQuestions[]` must render each sub-question separately, not just the main question
 
 ## Output Pattern
 Preferred deliverables:
