@@ -12,9 +12,9 @@ All KaTeX rendering must happen server-side (Step 3), NOT in a <script> tag.
 
 Usage:
   python3 export_homework_pdf.py \\
-    --school-name "哈尔滨工程大学" \\
-    --student-id "2025089104" \\
-    --password "$(security find-generic-password -a '2025089104' -s 'smartestu.cn' -w)" \\
+    --school-name "<school_name>" \\
+    --student-id "<student_local_id>" \\
+    --password "$(security find-generic-password -a '<student_local_id>' -s 'smartestu.cn' -w)" \\
     --out-dir /tmp/smartestu-export
 """
 import argparse
@@ -129,7 +129,7 @@ def export_pdf(html_path, pdf_path):
 
 def main():
     parser = argparse.ArgumentParser(description='Export smartestu homework to PDF')
-    parser.add_argument('--school-name', required=True, help='School name (e.g. 哈尔滨工程大学)')
+    parser.add_argument('--school-name', required=True, help='School name (resolved via /api/schools)')
     parser.add_argument('--student-id', required=True, help='Student local ID')
     parser.add_argument('--password', required=True, help='Password (do not log this)')
     parser.add_argument('--out-dir', default='/tmp/smartestu-export', help='Output directory')
