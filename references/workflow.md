@@ -6,9 +6,25 @@
 - `GET /api/schools`
 - Use to resolve school code from the human-readable school name.
 
-For Harbin Engineering University:
-- `code: heu`
-- `name: 哈尔滨工程大学`
+Example (placeholder):
+
+```json
+{
+  "schoolCode": "<school_code>",
+  "schoolUserLocalId": "<student_local_id>",
+  "schoolUserId": "<school_code>-<student_local_id>",
+  "password": "..."
+}
+```
+
+**Token location:** The login response returns the token at the **TOP LEVEL**, not nested under `data`:
+```json
+{
+  "token": "eyJ...",
+  "user": { "_id": "...", "schoolUserId": "<school_code>-<student_local_id>", "name": "..." }
+}
+```
+Extract as `response['token']`, NOT `response['data']['token']`.
 
 ### 2. Login
 - `POST /api/auth/login`
@@ -19,26 +35,6 @@ Working fields:
 - `schoolUserId` — format: `${schoolCode}-${schoolUserLocalId}`
 - `password`
 
-Example payload:
-
-```json
-{
-  "schoolCode": "heu",
-  "schoolUserLocalId": "2025089104",
-  "schoolUserId": "heu-2025089104",
-  "password": "..."
-}
-```
-
-**Token location:** The login response returns the token at the **TOP LEVEL**, not nested under `data`:
-```json
-{
-  "token": "eyJ...",
-  "user": { "_id": "...", "schoolUserId": "heu-2025089104", "name": "..." }
-}
-```
-Extract as `response['token']`, NOT `response['data']['token']`.
-
 ### 3. Query homework list
 - `POST /api/homework/student/mark/queryHomeworks`
 
@@ -46,7 +42,7 @@ Working payload:
 
 ```json
 {
-  "studentId": "heu-2025089104"
+  "studentId": "<school_code>-<student_local_id>"
 }
 ```
 
