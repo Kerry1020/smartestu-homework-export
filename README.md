@@ -65,11 +65,10 @@ The PDF path is treated as part of the product, not as an afterthought.
 The expected standard is:
 
 - formulas must render as math, not raw `$...$`
-- KaTeX assets from `unpkg.com` are the preferred default in this workflow
-- before export, verify that `window.katex`, `renderMathInElement`, and rendered `.katex` nodes are present
+- server-side (Node.js) KaTeX pre-rendering is the verified method — Chrome headless `--print-to-pdf` does NOT execute JavaScript
 - the default handout style should be readable instead of a continuous webpage dump
 - prefer one question per page when the user wants to answer directly below each problem
-- visually verify at least one preview or screenshot before claiming the export is correct
+- always HTML-escape `<`, `>`, `&` in question text before rendering (LaTeX formulas like `$P\{1<X<3\}$` contain raw `<` that browsers interpret as HTML tags)
 
 ## Installation
 
