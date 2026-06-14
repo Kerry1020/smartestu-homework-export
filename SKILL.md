@@ -20,7 +20,7 @@ Do not use this skill for generic LMS scraping where the site and payloads are u
 ## Credentials
 - Password is stored in macOS Keychain: `security find-generic-password -a "<student_local_id>" -s "smartestu.cn" -w`
 - If keychain lookup fails (needs user approval), ask the user for password once, then store it: `security add-generic-password -a "<student_local_id>" -s "smartestu.cn" -w "<password>"`
-- Known config: school_code=`heu` (Harbin Engineering University), student_local_id=`2025089104`
+- Known config: school_code=`<school_code>` (resolved via `/api/schools`), student_local_id=`<student_local_id>`
 - Do not echo passwords or tokens into chat logs, issues, screenshots, or repository files.
 
 ## Core Workflow
