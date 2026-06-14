@@ -1,7 +1,27 @@
 #!/usr/bin/env python3
+"""Export unsubmitted homework from smartestu.cn as KaTeX-rendered PDF.
+
+Pipeline:
+  1. API: login → query homeworks → extract unsubmitted
+  2. Save exercises JSON
+  3. Node.js katex (scripts/render_katex.js): server-side render formulas → self-contained HTML (no JS)
+  4. Chrome headless --print-to-pdf: HTML → PDF
+
+CRITICAL: Chrome headless --print-to-pdf does NOT execute JavaScript.
+All KaTeX rendering must happen server-side (Step 3), NOT in a <script> tag.
+
+Usage:
+  python3 export_homework_pdf.py \\
+    --school-name "哈尔滨工程大学" \\
+    --student-id "2025089104" \\
+    --password "$(security find-generic-password -a '2025089104' -s 'smartestu.cn' -w)" \\
+    --out-dir /tmp/smartestu-export
+"""
 import argparse
-import html
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from datetime import datetime
 
@@ -11,16 +31,26 @@ SCHOOLS_API = 'https://smartestu.cn/api/schools'
 LOGIN_API = 'https://smartestu.cn/api/auth/login'
 QUERY_HOMEWORKS_API = 'https://smartestu.cn/api/homework/student/mark/queryHomeworks'
 
+# Path to the server-side KaTeX renderer (lives next to this script)
+RENDER_SCRIPT = Path(__file__).parent / 'render_katex.js'
 
-def get_school_code(session: requests.Session, school_name: str) -> str:
+CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+
+
+def get_school_code(session, school_name):
+    """Resolve school code from human-readable name."""
     data = session.get(SCHOOLS_API, verify=False, timeout=30).json()
-    for school in data.get('schools', []):
+    schools = data.get('schools', data.get('data', {}).get('schools', []))
+    for school in schools:
         if school.get('name') == school_name:
             return school.get('code')
-    raise SystemExit(f'School not found: {school_name}')
+    # Fallback: print all schools so user can pick
+    available = ', '.join(s.get('name', '?') for s in schools)
+    raise SystemExit(f'School not found: {school_name}. Available: {available}')
 
 
-def login(session: requests.Session, school_code: str, student_local_id: str, password: str):
+def login(session, school_code, student_local_id, password):
+    """Login and return full response. Token is at TOP LEVEL, not under 'data'."""
     payload = {
         'schoolCode': school_code,
         'schoolUserLocalId': student_local_id,
@@ -32,123 +62,137 @@ def login(session: requests.Session, school_code: str, student_local_id: str, pa
     return resp.json()
 
 
-def get_latest_unsubmitted(session: requests.Session, token: str, school_code: str, student_local_id: str):
+def get_all_unsubmitted(session, token, school_user_id):
+    """Query homework list and return ALL unsubmitted items sorted by deadline."""
     headers = {'Authorization': f'Bearer {token}'}
-    payload = {'studentId': f'{school_code}-{student_local_id}'}
+    payload = {'studentId': school_user_id}
     resp = session.post(QUERY_HOMEWORKS_API, headers=headers, json=payload, verify=False, timeout=60)
     resp.raise_for_status()
     data = resp.json()
+
     homeworks = []
+    courses_seen = []
     for course in data.get('data', {}).get('courseHomeworkDTOList', []):
+        courses_seen.append(course.get('courseName', '?'))
         for hw in course.get('studentCourseHomeworkDTOList', []):
             item = dict(hw)
             item['courseName'] = course.get('courseName')
             homeworks.append(item)
-    unsubmitted = [h for h in homeworks if h.get('submission_status') == 'not_submitted']
-    if not unsubmitted:
-        raise SystemExit('No unsubmitted homework found')
+
+    unsubmitted = [
+        h for h in homeworks
+        if h.get('submission_status') == 'not_submitted' or h.get('status') == 0
+    ]
     unsubmitted.sort(key=lambda x: x.get('endTime', ''), reverse=True)
-    return unsubmitted[0]
+    return unsubmitted, courses_seen
 
 
-def build_rendered_html(homework: dict) -> str:
-    blocks = []
-    for idx, ex in enumerate(homework.get('exercises', []), start=1):
-        questions = ex.get('questions') or [{'type': 'text', 'content': ex.get('name', '(无题目内容)')}]
-        content = '\n\n'.join([
-            str(q.get('content', '')).strip()
-            for q in questions
-            if str(q.get('content', '')).strip()
-        ])
-        if not content:
-            content = ex.get('name', '(无题目内容)')
-        safe = html.escape(content).replace('\n', '<br>').replace('&amp;nbsp;', '&nbsp;')
-        blocks.append(
-            '<section class="question-card">\n'
-            f'  <div class="q-head">题目 {idx} <span class="q-sub">小题编号：{html.escape(str(ex.get("questionNum", "")))}</span></div>\n'
-            f'  <div class="q-body">{safe}</div>\n'
-            '</section>'
-        )
+def render_html_server_side(exercises, title, output_path):
+    """Use Node.js katex to pre-render all formulas into self-contained HTML.
 
-    homework_name = html.escape(str(homework.get('name', '')))
-    course_name = html.escape(str(homework.get('courseName', '')))
-    exercise_count = len(homework.get('exercises', []))
-    html_doc = f'''<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>未提交作业题目（公式渲染版）</title>
-  <script>
-    window.__math_ready = false;
-    window.MathJax = {{
-      tex: {{
-        inlineMath: [['$', '$'], ['\\\\(', '\\\\)']],
-        displayMath: [['$$', '$$'], ['\\\\[', '\\\\]']]
-      }},
-      svg: {{ fontCache: 'global' }},
-      startup: {{
-        pageReady: () => {{
-          return MathJax.startup.defaultPageReady().then(() => {{
-            window.__math_ready = true;
-          }});
-        }}
-      }}
-    }};
-  </script>
-  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
-  <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif; background:#f6f7fb; color:#111; margin:0; }}
-    .wrap {{ max-width: 980px; margin: 0 auto; padding: 40px 24px 80px; }}
-    .title {{ font-size: 32px; font-weight: 700; margin-bottom: 10px; }}
-    .meta {{ color:#555; font-size: 16px; margin-bottom: 28px; }}
-    .question-card {{ background:#fff; border-radius:16px; box-shadow:0 6px 24px rgba(0,0,0,.06); padding:24px 28px; margin-bottom:20px; page-break-inside: avoid; }}
-    .q-head {{ font-size:22px; font-weight:700; margin-bottom:16px; }}
-    .q-sub {{ font-size:14px; color:#666; font-weight:500; margin-left:12px; }}
-    .q-body {{ font-size:20px; line-height:1.85; word-break:break-word; color:#111; }}
-    .q-body mjx-container, .q-body svg, .q-body path, .q-body use {{ color:#111 !important; fill:#111 !important; stroke:#111 !important; }}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="title">未提交作业题目（公式渲染版）</div>
-    <div class="meta">作业：{homework_name} ｜ 课程：{course_name} ｜ 共 {exercise_count} 题</div>
-    {''.join(blocks)}
-  </div>
-</body>
-</html>'''
-    return html_doc
+    This is REQUIRED because Chrome headless --print-to-pdf does NOT execute JavaScript.
+    Browser-side KaTeX (renderMathInElement in <script>) will NOT appear in the PDF.
+    """
+    # Save exercises JSON for Node
+    exercises_path = str(output_path).replace('.html', '.exercises.json')
+    Path(exercises_path).write_text(json.dumps(exercises, ensure_ascii=False), encoding='utf-8')
+
+    # Run Node.js renderer
+    result = subprocess.run(
+        ['node', str(RENDER_SCRIPT),
+         '--input', exercises_path,
+         '--output', str(output_path),
+         '--title', title],
+        capture_output=True, text=True, timeout=30,
+        cwd=str(Path(output_path).parent),  # node needs katex module installed here
+    )
+    if result.returncode != 0:
+        print(f'render_katex.js failed: {result.stderr}', file=sys.stderr)
+        raise SystemExit(1)
+    print(result.stderr.strip(), file=sys.stderr)
+    return output_path
+
+
+def export_pdf(html_path, pdf_path):
+    """Export pre-rendered HTML to PDF via Chrome headless."""
+    if not Path(CHROME).exists():
+        print(f'WARNING: Chrome not found at {CHROME}, skipping PDF export', file=sys.stderr)
+        return False
+    result = subprocess.run([
+        CHROME, '--headless', '--disable-gpu',
+        f'--print-to-pdf={pdf_path}',
+        '--print-to-pdf-no-header',
+        f'file://{html_path}'
+    ], capture_output=True, timeout=30)
+    return Path(pdf_path).exists()
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--school-name', required=True)
-    parser.add_argument('--student-id', required=True)
-    parser.add_argument('--password', required=True)
-    parser.add_argument('--out-dir', default='/tmp/openclaw/smartestu-export')
+    parser = argparse.ArgumentParser(description='Export smartestu homework to PDF')
+    parser.add_argument('--school-name', required=True, help='School name (e.g. 哈尔滨工程大学)')
+    parser.add_argument('--student-id', required=True, help='Student local ID')
+    parser.add_argument('--password', required=True, help='Password (do not log this)')
+    parser.add_argument('--out-dir', default='/tmp/smartestu-export', help='Output directory')
     args = parser.parse_args()
-
-    session = requests.Session()
-    school_code = get_school_code(session, args.school_name)
-    login_data = login(session, school_code, args.student_id, args.password)
-    homework = get_latest_unsubmitted(session, login_data['token'], school_code, args.student_id)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    rendered = build_rendered_html(homework)
-    (out_dir / 'rendered.html').write_text(rendered, encoding='utf-8')
-    (out_dir / 'homework.json').write_text(json.dumps(homework, ensure_ascii=False, indent=2), encoding='utf-8')
+
+    # Ensure katex is installed for Node
+    node_modules = out_dir / 'node_modules' / 'katex'
+    if not node_modules.exists():
+        print('Installing katex...', file=sys.stderr)
+        subprocess.run(['npm', 'install', 'katex@0.16.9'], check=True, capture_output=True, cwd=str(out_dir))
+
+    # API calls
+    session = requests.Session()
+    school_code = get_school_code(session, args.school_name)
+    login_data = login(session, school_code, args.student_id, args.password)
+    token = login_data['token']  # TOP LEVEL
+    school_user_id = f'{school_code}-{args.student_id}'
+
+    unsubmitted, courses_seen = get_all_unsubmitted(session, token, school_user_id)
+
+    if not unsubmitted:
+        print(json.dumps({
+            'status': 'no_unsubmitted',
+            'courses_checked': courses_seen,
+        }, ensure_ascii=False, indent=2))
+        return
+
+    results = []
+    for hw in unsubmitted:
+        hw_name = hw.get('name', 'homework')
+        safe_name = hw_name.replace('/', '_').replace(' ', '_')
+        html_path = out_dir / f'{safe_name}.html'
+        pdf_path = out_dir / f'{safe_name}.pdf'
+
+        # Step 1: Server-side KaTeX rendering → self-contained HTML
+        exercises = hw.get('exercises', [])
+        render_html_server_side(exercises, hw_name, html_path)
+
+        # Step 2: Chrome headless HTML → PDF
+        pdf_ok = export_pdf(str(html_path), str(pdf_path))
+
+        results.append({
+            'homework_name': hw_name,
+            'course': hw.get('courseName', ''),
+            'endTime': hw.get('endTime', ''),
+            'exercise_count': len(exercises),
+            'html': str(html_path),
+            'pdf': str(pdf_path) if pdf_ok else None,
+            'pdf_exported': pdf_ok,
+        })
+
     summary = {
         'school_code': school_code,
-        'homework_id': homework.get('id'),
-        'homework_name': homework.get('name'),
-        'course_name': homework.get('courseName'),
-        'exercise_count': len(homework.get('exercises', [])),
+        'unsubmitted_count': len(unsubmitted),
+        'courses_checked': courses_seen,
         'generated_at': datetime.now().isoformat(),
-        'rendered_html': str(out_dir / 'rendered.html'),
-        'raw_json': str(out_dir / 'homework.json'),
+        'homeworks': results,
     }
-    (out_dir / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+    summary_path = out_dir / 'summary.json'
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

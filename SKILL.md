@@ -17,10 +17,10 @@ For this site, API-first beats browser-first. Use browser automation for visual 
 
 Do not use this skill for generic LMS scraping where the site and payloads are unknown.
 
-## Privacy and Safety
-- This repository contains no live credentials, tokens, or session data.
-- Any identifiers shown in examples must be fictional placeholders.
-- Credentials should only be used for the current login session.
+## Credentials
+- Password is stored in macOS Keychain: `security find-generic-password -a "<student_local_id>" -s "smartestu.cn" -w`
+- If keychain lookup fails (needs user approval), ask the user for password once, then store it: `security add-generic-password -a "<student_local_id>" -s "smartestu.cn" -w "<password>"`
+- Known config: school_code=`heu` (Harbin Engineering University), student_local_id=`2025089104`
 - Do not echo passwords or tokens into chat logs, issues, screenshots, or repository files.
 
 ## Core Workflow
@@ -34,26 +34,6 @@ Match the school entry first.
 Example placeholder form:
 - `name = "<school_name>"`
 - `code = "<school_code>"`
-
-### 1.1 Verify response shape before parsing
-Do not assume endpoint response structure from memory, older notes, or nearby APIs.
-
-Hard requirements:
-- before writing parsing logic for a Smartestu endpoint, inspect a real response sample from that exact endpoint
-- record whether the top-level payload is an object, array, or nested `data` wrapper
-- do not assume `/api/schools` returns a bare array; verify whether it is `{ "schools": [...] }` or another wrapper in the current environment
-- do not reuse parsing assumptions from login or homework endpoints for school-list endpoints
-- when a response shape is uncertain, print or inspect the first layer of keys before iterating fields
-
-Failure pattern to avoid:
-- writing `for item in response` before confirming whether `response` is the array itself or an object containing the array
-- treating a successful `200` response as proof that parsing assumptions are correct
-- “the endpoint exists” and “the parser is correct” are separate checks
-
-Recommended guardrail:
-- first validate the shape
-- then extract the correct collection field
-- only then search/match school entries or flatten homework arrays
 
 ### 2. Log in with the real payload shape
 Use:
@@ -74,6 +54,8 @@ Critical details:
 - `schoolUserId` should be `${schoolCode}-${schoolUserLocalId}`
 - guessing with only a raw student id is unreliable
 - the bearer token returned by login is enough for downstream homework queries
+- the login response returns token at the **TOP LEVEL** (`response['token']`), NOT nested under `response['data']['token']`
+- the homework list API response **already contains full exercise data inline** (including `questionStructure[].mainQuestion.questionMd` and `subQuestions[].questionMd`) — no separate API call needed
 - do not echo the user's password back into chat or logs
 
 ### 3. Query homework list
@@ -92,149 +74,102 @@ Critical detail:
 - this API expects the school-style `schoolUserId` string
 - the internal Mongo-style `_id` is the wrong identifier here
 
-### 4. Pick the latest unsubmitted homework
+### 4. Pick unsubmitted homework (ALL of them)
 Flatten:
 - `data.courseHomeworkDTOList[].studentCourseHomeworkDTOList[]`
 
 Then filter and sort:
-- keep `submission_status == "not_submitted"`
+- keep `submission_status == "not_submitted"` (also check `status == 0` as backup)
 - sort by `endTime` descending
-- choose the newest item
+- **Return ALL unsubmitted items, not just the latest one**
+- If no unsubmitted found, explicitly report "0 unsubmitted across N courses" so the user can verify
 
-### 5. Extract questions in display order
+Important: the API may only return courses that have homework assigned. If the user expects a course that doesn't appear, that course may not be on this platform or may have no homework yet. Report the full course list so the user can spot gaps.
+
+### 5. Extract questions (with sub-questions)
 Use the homework object directly:
-- `exercises[]`
-- `exercises[].questions[]`
+- `exercises[]` → each exercise has `questions[]` and optionally `questionStructure[]`
 
 Recommended order:
 1. iterate `exercises` in array order
-2. iterate each `questions[]` in array order
-3. join `question.content`
-4. if question content is empty, fall back to the exercise title or name
+2. For each exercise, check `questionStructure[]` first:
+   - `questionStructure[].mainQuestion.questionMd` = main question text
+   - `questionStructure[].subQuestions[]` = sub-parts with their own `questionMd`
+3. Fallback: `questions[].content` if questionStructure is empty
+4. If both empty, fall back to `exercise.name`
 
 Useful fields:
-- `exercise.questionNum`
-- `exercise.name`
-- `exercise.questions[].content`
-- `exercise.questions[].type`
+- `exercise.questionNum`, `exercise.name`, `exercise.score`
+- `exercise.questions[].content`, `exercise.questions[].type`
+- `questionStructure[].mainQuestion.questionMd` (preferred for rendering)
+- `questionStructure[].subQuestions[].questionMd`
 
-### 5.1 Preserve structure, not just text
-Do not flatten structured question content into plain text if structure carries meaning.
+### 6. Preserve formulas with Server-Side KaTeX Rendering
 
-Required handling:
-- preserve Markdown tables as real HTML tables before PDF export
-- preserve explicit line breaks, list structure, and simple inline HTML such as `<br>` when present in source content
-- if multiple tables appear in one question, render all of them
-- if a structure cannot be rendered faithfully, treat the export as incomplete instead of silently degrading it to paragraph text
+**CRITICAL: Chrome headless `--print-to-pdf` does NOT execute JavaScript.** Browser-side KaTeX rendering (via `renderMathInElement` in a `<script>` tag) will NOT appear in the PDF. The PDF will contain raw `$...$` text, not rendered formulas. This was verified extensively — `--virtual-time-budget` and `--headless=new` flags do not fix it.
 
-Structural verification targets:
-- tabular content in source should become visible table elements in the rendered HTML/PDF
-- probability/distribution tables must remain readable row/column layouts
-- the output should read like the original homework handout, not a text dump with `|` separators
+**The correct approach is server-side (Node.js) KaTeX pre-rendering:**
 
-### 5.2 Anti-silent-degradation rules
-These rules exist to stop “looks good enough” exports.
+1. `npm install katex@0.16.9` in a working directory
+2. Use Node.js katex module to render all `$...$` and `$$...$$` formulas into HTML spans BEFORE writing the HTML file
+3. Inline the KaTeX CSS into the HTML `<style>` block
+4. Download KaTeX font files locally and use `file:///` absolute paths in the CSS
+5. The resulting HTML has **no JavaScript** — all formulas are pre-rendered HTML
+6. Chrome headless can then correctly print this pre-rendered HTML to PDF
 
-Hard requirements:
-- source structure decides output structure; if the source contains tables, the final output must contain tables
-- do not confuse math rendering success with overall render success; formulas can pass while tables still fail
-- do not treat plain-text preservation as acceptable when the original layout carries semantic meaning
-- do not claim success just because the PDF opens, has pages, or contains all characters
-- do not silently ship a degraded file and explain the limitation afterward; detect the degradation first and continue fixing
+See `scripts/render_katex.js` for the verified working server-side renderer.
 
-Required source scan before export:
-- inspect representative `question.content` samples, not just homework metadata
-- explicitly check whether content contains Markdown tables, repeated `|`-delimited rows, `<br>`, list markers, or other structure-sensitive patterns
-- if any such pattern appears in source, add a matching render step and a matching verification step before generating the final PDF
+#### HTML escaping (CRITICAL)
 
-### 5.3 Failure gates for structured content
-Treat any of the following as an export failure, not a cosmetic issue:
-- raw Markdown table separators such as `|---|`, `| --- |`, or repeated pipe rows remain visible in final presentation
-- a question that should contain a table is rendered as a paragraph with pipes
-- line breaks collapse and change the meaning or readability of the problem
-- multiple tables in one question collapse into one block of text
-- inline HTML needed for meaning is escaped away instead of rendered safely
+Question text from the API contains raw `<` and `>` inside LaTeX formulas (e.g. `$P\{1<X<3\}$`). These are interpreted as HTML tags by the browser, causing **silent content truncation** — everything after `<X` disappears.
 
-### 6. Preserve formulas with HTML + KaTeX
-Do not rely on screenshots if formulas matter.
+**Always HTML-escape `<`, `>`, and `&` in question text before inserting into HTML:**
 
-Reliable render approach:
-- write a temporary HTML file
-- prefer KaTeX assets from `unpkg.com` for this workflow
-- if remote KaTeX assets do not actually load in the browser/runtime, switch to a local mirrored KaTeX asset bundle before continuing
-- support these delimiters:
-  - `$$ ... $$`
-  - `$ ... $`
-  - `\( ... \)`
-  - `\[ ... \]`
-- if a PDF is the deliverable, verify the page runtime before export:
-  - `window.katex` exists
-  - `renderMathInElement` exists
-  - rendered `.katex` nodes are present
-  - raw `$...$` is no longer visible in the rendered text
-  - when source contains tables, rendered `<table>` nodes are present in the final verified HTML
-  - raw Markdown table separators like `|---|` are no longer visible as the final presentation for those questions
-- never treat HTML generation or PDF generation alone as success
-- never claim the export is correct until the runtime checks above have passed
-- do not trust `file://` preview/export when external math assets are required unless runtime verification proves those assets actually loaded
-- if math stays as raw `$...$`, treat the export as failed and switch asset host, local asset strategy, or rendering path before continuing
-- if tables stay as raw Markdown, treat the export as failed and add a structure-aware rendering step before continuing
-- if you copy or move the verified HTML, re-check every relative asset path from the final delivery file location
-- the file you verify in the browser must be the same path you later export or send; a working sibling file does not prove the final deliverable works
+```javascript
+function htmlEscape(text) {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+```
 
-### 6.1 Verification checklist before sending
-Do not send the file until all applicable checks below pass.
+Apply escaping BEFORE KaTeX rendering (KaTeX will handle the escaped entities correctly within `$...$` delimiters).
 
-Minimum runtime checks:
-- `window.katex === true` or equivalent positive availability check
-- `renderMathInElement` exists
-- rendered `.katex` node count is greater than zero when formulas exist in source
-- rendered `<table>` node count is greater than zero when tables exist in source
-- raw `$...$` is not visible in final rendered text for formula-bearing questions
-- raw Markdown table separators are not the final visible presentation for table-bearing questions
+#### Font files
 
-Minimum visual checks:
-- inspect at least one formula-heavy question
-- inspect at least one table-heavy question when tables exist
-- confirm table borders/cells are readable and row/column grouping still makes sense
-- confirm one-question-per-page layout did not cut tables into unreadable fragments
+KaTeX CSS references ~60 font files (woff2, ttf, woff). For Chrome headless PDF to render formulas correctly, these must be available locally:
 
-Artifact checks:
-- regenerate the PDF after the last HTML fix
-- verify PDF timestamp/size changed after regeneration
-- send the exact file generated from the exact verified HTML path
+```bash
+mkdir -p /tmp/katex-fonts
+# Extract font filenames from CSS and download each
+grep -o 'fonts/[^)]*' katex.min.css | sort -u | while read f; do
+  curl -s "https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/$f" -o "/tmp/katex-fonts/$(basename $f)"
+done
+```
 
-### 6.2 Explicit anti-stupidity reminders
-If you are tempted to say any of these, stop and keep fixing:
-- “公式都渲染了，应该差不多了”
-- “表格只是样式问题，不影响内容”
-- “PDF 能打开就算成功”
-- “用户如果发现表格有问题我再修”
-- “HTML 看起来差不多，先发再说”
+Then in the CSS, replace `url(fonts/` with `url(file:///tmp/katex-fonts/`.
 
-Reality:
-- formula pass does not imply structure pass
-- table loss is content loss, not just style loss
-- opening successfully is not correctness
-- post-send repair is failure, not acceptable default behavior
+#### Browser for verification only
+
+The browser tool CAN render KaTeX (it executes JavaScript). Use it to verify formulas look correct, but do NOT use it for PDF export. The browser-verified HTML and the Chrome-headless-printed HTML are different files — always print from the server-side pre-rendered HTML.
 
 ### 7. Export PDF
 Reliable local pattern:
-1. write `rendered.html`
-2. open the local page in an available browser tool
-3. wait for math assets to load and confirm formulas are actually rendered
-4. export the PDF from that exact verified file path
-5. check the output PDF timestamp/size so you know you are sending the newly regenerated file, not an older stale artifact
+1. Use `scripts/render_katex.js` to generate pre-rendered HTML (server-side KaTeX)
+2. Print with Chrome headless:
+   ```bash
+   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+     --headless --disable-gpu --print-to-pdf-no-header \
+     --print-to-pdf="output.pdf" \
+     "file:///path/to/prerendered.html"
+   ```
+3. Check the output PDF timestamp/size so you know you are sending the newly regenerated file
 
 PDF rendering standard:
 - default deliverable should be readable as a homework handout, not a continuous webpage dump
 - prefer `one question per page` so the user can answer directly under each problem
-- keep formulas rendered, not raw LaTeX source
-- visually verify at least one preview or screenshot before claiming success
-- this visual check is required but not sufficient; the runtime KaTeX checks above are a hard gate
-- if a compact all-in-one PDF is also useful, send both variants
+- keep formulas rendered (server-side), not raw LaTeX source
+- **NEVER rely on browser-side JS rendering for PDF** — Chrome headless does not execute JavaScript. Use server-side KaTeX pre-rendering only (see Section 6).
 - if the user wants PDF only, do not send ZIP/HTML as the final handoff
-- before sending the PDF, verify that the final file corresponds to the verified HTML revision and was regenerated after the last HTML fix
+- before sending the PDF, verify that the final file was regenerated from the server-side pre-rendered HTML
 
 ## Browser Fallback
 If visual verification is needed:
@@ -256,14 +191,19 @@ If visual verification is needed:
 - Using browser scraping first when the API path is known
 - Sending only `studentId` without building `schoolUserId`
 - Using internal `_id` instead of the school-style student identifier
-- Assuming response shape from memory instead of checking the real top-level payload first
-- Treating a `200` response as if it proves the parser is correct
 - Picking the first unsubmitted homework instead of sorting by `endTime`
+- **Returning only the latest unsubmitted instead of ALL unsubmitted** — always report the full list
+- **Claiming "no unsubmitted" without showing the course list** — always show which courses were checked so the user can spot missing ones
+- **NOT HTML-escaping `<` and `>` in question text before rendering** — LaTeX formulas like `$P\{1<X<3\}$` contain raw `<` that browsers interpret as HTML tags, silently truncating all content after the `<`. ALWAYS escape first.
+- **Trusting Chrome headless `--print-to-pdf` to execute JavaScript** — it does NOT. Browser-side KaTeX rendering (`renderMathInElement` in a `<script>` tag) will NOT appear in the PDF. Use server-side Node.js katex pre-rendering instead (see Section 6).
+- **Forgetting to download KaTeX font files locally** — without the actual woff2/ttf files, Chrome headless PDF shows formula boxes without proper glyphs. Download all ~60 font files and use `file:///` paths.
 - Exporting raw text or screenshots and losing formulas
 - Repeating credentials in chat history
 - Verifying one HTML file and sending a different copied/moved file with broken relative asset paths
 - Fixing the HTML but forgetting to regenerate the PDF, then accidentally sending a stale older PDF
-- Claiming success from DOM/runtime checks alone without checking that the final delivered artifact was rebuilt from that verified state
+- **Forgetting sub-questions**: exercises with `questionStructure[].subQuestions[]` must render each sub-question separately, not just the main question
+- **Using `questions[].content` instead of `questionStructure[].mainQuestion.questionMd`**: the `questionStructure` path preserves LaTeX formulas properly; `questions[].content` is a plain-text fallback that may lose formatting
+- **Extracting token from wrong level**: login response token is at `response['token']` (top level), NOT `response['data']['token']`
 
 ## Output Pattern
 Preferred deliverables:
