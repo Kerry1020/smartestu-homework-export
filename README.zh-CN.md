@@ -145,4 +145,4 @@ smartestu-homework-export/
 
 ## License
 
-本项目采用 MIT License，详见 [LICENSE](./LICENSE)。
+本项目采用 GPL-3.0 License，详见 [LICENSE](./LICENSE)。

@@ -145,4 +145,4 @@ When updating the skill, keep these rules aligned:
 
 ## License
 
-This project is released under the MIT License. See [LICENSE](./LICENSE).
+This project is released under the GNU General Public License v3.0. See [LICENSE](./LICENSE).
