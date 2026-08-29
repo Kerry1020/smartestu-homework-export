@@ -79,6 +79,11 @@
 ```text
 <your-skills-root>/smartestu-homework-export/
 ├── SKILL.md
+├── references/
+│   └── workflow.md
+├── scripts/
+│   ├── export_homework_pdf.py
+│   └── render_katex.js
 ├── README.md
 └── README.zh-CN.md
 ```
@@ -128,6 +133,11 @@
 ```text
 smartestu-homework-export/
 ├── SKILL.md
+├── references/
+│   └── workflow.md
+├── scripts/
+│   ├── export_homework_pdf.py
+│   └── render_katex.js
 ├── README.md
 ├── README.zh-CN.md
 └── LICENSE
