@@ -1,153 +1,119 @@
 # smartestu-homework-export
 
+[![CI](https://github.com/Kerry1020/smartestu-homework-export/actions/workflows/ci.yml/badge.svg)](https://github.com/Kerry1020/smartestu-homework-export/actions/workflows/ci.yml)
+
 [简体中文](./README.zh-CN.md)
 
-`smartestu-homework-export` is a reusable skill for exporting homework from smartestu.cn / 数你最灵 into a cleaner, reusable study format. It focuses on one practical path: find the latest unsubmitted homework, keep the original question order, preserve math formulas, and produce a readable PDF deliverable.
+An agent skill (Claude Code / Agent SDK `SKILL.md` format) and standalone CLI
+that exports your **unsubmitted homework from smartestu.cn (数你最灵)** to
+printable PDFs. Each question goes on its own page, with math rendered by KaTeX.
 
-## What this project is
+- Uses the Smartestu API directly instead of scraping pages in a browser
+- Reports every unsubmitted assignment, newest deadline first, plus the list of courses it checked
+- Includes main questions and sub-questions in their original order
+- Renders KaTeX formulas before printing, so the HTML needs no JavaScript and Chrome headless prints the math correctly
+- Leaves A4 answer space under each question
 
-This repository packages a focused skill for one specific platform workflow:
+It is not a general-purpose LMS scraper and does not submit anything.
 
-1. identify the latest unsubmitted Smartestu homework
-2. extract the questions in display order
-3. preserve formulas during export
-4. generate a PDF that is actually usable for reading or answering
+## Requirements
 
-It is not a generic LMS scraper and does not try to support every education platform.
-
-## What the skill does
-
-The skill is designed around Smartestu's real homework workflow.
-
-- resolves the school code first
-- logs in with the expected Smartestu payload shape
-- queries the homework list
-- selects the latest unsubmitted assignment
-- extracts ordered question content from the homework object itself
-- exports the result through an HTML + KaTeX rendering path
-- produces a printable PDF deliverable
-
-## Key features
-
-- API-first workflow instead of fragile browser scraping
-- question extraction in original display order
-- formula-preserving HTML export with KaTeX
-- PDF export standards that require real math rendering verification
-- one-question-per-page output for answer-friendly handouts
-- privacy-aware examples with placeholders instead of real account data
-
-## Why API-first
-
-For this platform, API-first is more reliable than browser-first.
-
-Browser automation is still useful for visual verification, but it should not be the primary extraction path when the underlying homework data can already be read from the API response. That keeps the workflow more stable and makes the exported output easier to control.
-
-## Smartestu workflow summary
-
-The skill follows this sequence:
-
-1. `GET /api/schools`
-2. `POST /api/auth/login`
-3. `POST /api/homework/student/mark/queryHomeworks`
-4. flatten `courseHomeworkDTOList[].studentCourseHomeworkDTOList[]`
-5. filter `submission_status == "not_submitted"`
-6. sort by `endTime` descending
-7. extract `exercises[].questions[]` in array order
-8. render formulas through HTML + KaTeX
-9. export a readable PDF
-
-This repository keeps those platform-specific details because they are the whole point of the skill.
-
-## PDF rendering standards
-
-The PDF path is treated as part of the product, not as an afterthought.
-
-The expected standard is:
-
-- formulas must render as math, not raw `$...$`
-- server-side (Node.js) KaTeX pre-rendering is the verified method — Chrome headless `--print-to-pdf` does NOT execute JavaScript
-- the default handout style should be readable instead of a continuous webpage dump
-- prefer one question per page when the user wants to answer directly below each problem
-- always HTML-escape `<`, `>`, `&` in question text before rendering (LaTeX formulas like `$P\{1<X<3\}$` contain raw `<` that browsers interpret as HTML tags)
+- Python 3.9+
+- Node.js 18+ and npm
+- Google Chrome, Chromium or Microsoft Edge (only for PDF output)
+- macOS Keychain is optional. It is the most convenient way to store the password.
 
 ## Installation
 
-Place the skill directory where your skills are loaded.
-
-A typical local layout is:
-
-```text
-<your-skills-root>/smartestu-homework-export/
-├── SKILL.md
-├── README.md
-└── README.zh-CN.md
+```bash
+git clone https://github.com/Kerry1020/smartestu-homework-export.git
+cd smartestu-homework-export
+npm ci                                    # katex 0.16.9 (pinned in package-lock.json)
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 
-If your environment uses a different skill discovery path, copy `SKILL.md` into the corresponding skills directory and keep the README files alongside it for maintenance.
+To use it as a skill, put the whole directory (not only `SKILL.md`) where your
+agent loads skills, for example `~/.claude/skills/smartestu-homework-export/`.
+Then ask for things like "export my unsubmitted 数你最灵 homework as PDF".
 
 ## Usage
 
-Typical requests that should trigger this skill:
+```bash
+# Store the password once (macOS). Omitting the value after -w makes it prompt.
+security add-generic-password -a "<student_id>" -s "smartestu.cn" -w
 
-- "Export my latest unsubmitted Smartestu homework"
-- "Get the newest 数你最灵 homework and package it for me"
-- "Make this Smartestu homework into a PDF with formulas preserved"
-- "Export the homework one question per page so I can answer below it"
-
-The user will still need to provide live credentials during their own session when authentication is required. Those credentials should never be committed, documented in examples, or pasted into public issue threads.
-
-## Example placeholder payloads
-
-```json
-{
-  "schoolCode": "<school_code>",
-  "schoolUserLocalId": "<student_local_id>",
-  "schoolUserId": "<school_user_id>",
-  "password": "<password>"
-}
+.venv/bin/python scripts/export_homework_pdf.py \
+  --school-name "<school_name>" --student-id "<student_id>" --keychain \
+  --out-dir ~/Desktop/homework
 ```
 
-```json
-{
-  "studentId": "<school_user_id>"
-}
+Other ways to pass the password (first match wins): `--password-stdin`,
+the `SMARTESTU_PASSWORD` environment variable, `--keychain`, or `--password`.
+`--password` is discouraged because the value shows up in `ps` and in shell history.
+
+Useful options:
+
+| Option | Purpose |
+|---|---|
+| `--school-code CODE` | skip the school-name lookup |
+| `--latest-only` | export only the homework with the latest deadline |
+| `--no-pdf` | write HTML only |
+| `--chrome PATH` | browser binary (or set `CHROME_PATH`) |
+| `--from-json FILE` | offline: render a saved `queryHomeworks` response |
+| `--insecure` | disable TLS verification (not normally needed) |
+
+Output: one `<homework>.html` and one `<homework>.pdf` per assignment, plus a
+`summary.json` file. The same summary is printed to stdout.
+
+Exit codes: `0` ok (including "no unsubmitted homework"), `1` unexpected
+error, `2` usage / school not found / no password, `3` network, login or API
+error, `4` KaTeX rendering, `5` PDF export.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `School not found` / `ambiguous` | use the exact name shown on smartestu, or `--school-code` (see `curl https://smartestu.cn/api/schools`) |
+| `Login failed` / exit 3 | check the student id (without the school prefix) and the password; check the Keychain item with `security find-generic-password -a <id> -s smartestu.cn` |
+| `katex npm package is not installed` / exit 4 | run `npm ci` in the repository root |
+| `Chrome/Chromium not found` / exit 5 | install Chrome, or pass `--chrome` / set `CHROME_PATH`; or use `--no-pdf` |
+| Chrome timeout | close any Chrome profile dialogs and try again; never add a custom `--user-data-dir` (Chrome hangs on macOS) |
+| red formula text in the PDF | that formula is invalid TeX in the source; `grep katex-error *.html` finds it |
+| `0 unsubmitted` but you expected some | look at `courses_checked`: the API only lists courses that have homework on the platform |
+
+## Privacy
+
+This repository contains no credentials, tokens or personal data. All examples
+use placeholders such as `<school_code>` and `<student_id>`. Do not paste real
+values into issues, commits or logs.
+
+## Development
+
+```bash
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest      # Python tests (network and Chrome are mocked)
+npm test                        # renderer tests (node:test)
 ```
 
-These are placeholders only. This repository intentionally includes no real school, student, password, token, or session values.
-
-## Privacy and security notes
-
-- no live credentials, tokens, or session data are stored in this repository
-- all examples should remain fictional placeholders
-- credentials should be used only for the current session
-- do not copy secrets into repository files, screenshots, GitHub issues, or chat logs
-- if you fork or adapt this skill, keep the same sanitization standard
-
-## Repository structure
+CI runs both suites on Python 3.9 and 3.12. See
+[`references/workflow.md`](./references/workflow.md) for the API payloads and
+the rendering pitfalls (HTML escaping vs. TeX, why rendering has to happen
+server-side).
 
 ```text
 smartestu-homework-export/
-├── SKILL.md
-├── references/
-│   └── workflow.md
+├── SKILL.md                    # skill entry point
+├── references/workflow.md      # API + rendering reference
 ├── scripts/
-│   ├── export_homework_pdf.py
-│   └── render_katex.js
-├── README.md
-├── README.zh-CN.md
-└── LICENSE
+│   ├── export_homework_pdf.py  # CLI
+│   └── render_katex.js         # KaTeX renderer (JSON in/out)
+├── tests/
+├── package.json / package-lock.json
+└── requirements.txt / requirements-dev.txt
 ```
 
-## Maintenance notes
-
-When updating the skill, keep these rules aligned:
-
-- preserve the API-first workflow unless the platform itself changes
-- update both English and Chinese READMEs together
-- keep all examples sanitized
-- keep the PDF rendering standard explicit
-- verify that any new export path still preserves formulas correctly
+When you change behaviour, update both READMEs.
 
 ## License
 
-This project is released under the GNU General Public License v3.0. See [LICENSE](./LICENSE).
+GPL-3.0. See [LICENSE](./LICENSE).
