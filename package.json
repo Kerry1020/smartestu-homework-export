@@ -1,0 +1,16 @@
+{
+  "name": "smartestu-homework-export",
+  "version": "1.2.0",
+  "private": true,
+  "description": "Server-side KaTeX renderer for the smartestu-homework-export skill",
+  "license": "GPL-3.0-only",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test tests/render_katex.test.js"
+  },
+  "dependencies": {
+    "katex": "0.16.9"
+  }
+}
