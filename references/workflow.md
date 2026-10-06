@@ -1,128 +1,106 @@
-# Smartestu Homework Export Workflow Reference
+# Smartestu Homework Export: Workflow Reference
 
-## Confirmed Working API Path
+Background for `scripts/export_homework_pdf.py`. All examples use placeholders.
 
-### 1. School lookup
-- `GET /api/schools`
-- Use to resolve school code from the human-readable school name.
+## API
 
-Example (placeholder):
+Base URL: `https://smartestu.cn`. TLS certificates are valid; keep verification on.
+
+### 1. School lookup: `GET /api/schools`
+
+Response: `{"schools": [{"_id": "...", "code": "<school_code>", "name": "<school_name>", "status": "enabled"}, ...]}`
+
+The script matches the exact name or code first, then a unique substring of the
+name. `--school-code` skips this call.
+
+### 2. Login: `POST /api/auth/login`
 
 ```json
 {
   "schoolCode": "<school_code>",
   "schoolUserLocalId": "<student_local_id>",
   "schoolUserId": "<school_code>-<student_local_id>",
-  "password": "..."
+  "password": "<password>"
 }
 ```
 
-**Token location:** The login response returns the token at the **TOP LEVEL**, not nested under `data`:
-```json
-{
-  "token": "eyJ...",
-  "user": { "_id": "...", "schoolUserId": "<school_code>-<student_local_id>", "name": "..." }
-}
-```
-Extract as `response['token']`, NOT `response['data']['token']`.
-
-### 2. Login
-- `POST /api/auth/login`
-
-Working fields:
-- `schoolCode`
-- `schoolUserLocalId`
-- `schoolUserId` — format: `${schoolCode}-${schoolUserLocalId}`
-- `password`
-
-### 3. Query homework list
-- `POST /api/homework/student/mark/queryHomeworks`
-
-Working payload:
+- `schoolUserId` must be `${schoolCode}-${schoolUserLocalId}`. A raw student id alone does not work.
+- The token is at the **top level**: `response["token"]`, not `response["data"]["token"]`.
 
 ```json
-{
-  "studentId": "<school_code>-<student_local_id>"
-}
+{ "token": "eyJ...", "user": { "_id": "...", "schoolUserId": "<school_code>-<student_local_id>", "name": "..." } }
 ```
 
-**Key insight:** This API response **already contains full exercise data inline** — including `questionStructure[].mainQuestion.questionMd` and `questionStructure[].subQuestions[].questionMd`. No separate API call is needed to get question content. The response is ~1MB+ for a student with multiple courses.
+### 3. Homework list: `POST /api/homework/student/mark/queryHomeworks`
 
-## Homework Selection Rule
+Header `Authorization: Bearer <token>`, body:
 
-Flatten:
-- `data.courseHomeworkDTOList[].studentCourseHomeworkDTOList[]`
-
-Then filter:
-- `submission_status == "not_submitted"` (snake_case field — `submissionStatus` camelCase also exists but snake_case is more reliable)
-- OR `status == 0` as backup check
-
-Sort by `endTime` descending. **Return ALL unsubmitted items.**
-
-## Question Extraction Priority
-
-1. `questionStructure[].mainQuestion.questionMd` (preferred — preserves LaTeX formulas)
-2. `questionStructure[].subQuestions[].questionMd` (sub-questions — MUST render separately)
-3. Fallback: `questions[].content`
-4. Last resort: `exercise.name`
-
-**Critical:** Exercises with `subQuestions[]` must render each sub-question separately with its own number. Missing sub-questions is a silent data loss bug.
-
-## Rendering Pipeline (CORRECTED)
-
-### The Problem
-
-**Chrome headless `--print-to-pdf` does NOT execute JavaScript.** This was verified extensively:
-- `--virtual-time-budget=10000` does not help
-- `--headless=new` does not help
-- CDP `Page.printToPDF` after waiting also does not help
-- Browser-side KaTeX (`renderMathInElement` in a `<script>` tag) produces raw `$...$` text in the PDF, not rendered formulas
-
-### The Solution: Server-Side KaTeX Pre-Rendering
-
-Use Node.js katex module to render all `$...$` and `$$...$$` formulas into HTML spans BEFORE writing the HTML file.
-
-1. `npm install katex@0.16.9` in working directory
-2. Run `scripts/render_katex.js` — reads exercises JSON, outputs self-contained HTML with:
-   - All formulas pre-rendered as KaTeX HTML spans
-   - KaTeX CSS inlined with font paths pointing to local `file:///` URLs
-   - **No JavaScript** in the output
-3. Feed the pre-rendered HTML to Chrome headless `--print-to-pdf`
-
-See `scripts/render_katex.js` for the verified working renderer.
-
-### HTML Escaping (CRITICAL)
-
-Question text from the API contains raw `<` and `>` inside LaTeX formulas (e.g. `$P\{1<X<3\}$`). These are interpreted as HTML tags by the browser, causing **silent content truncation** — everything after `<X` disappears.
-
-**Always HTML-escape `<`, `>`, and `&` in question text BEFORE inserting into HTML**, then render KaTeX on the escaped text:
-
-```javascript
-function htmlEscape(text) {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-// Escape first, then render formulas
-renderFormulas(htmlEscape(questionMd));
+```json
+{ "studentId": "<school_code>-<student_local_id>" }
 ```
 
-### Font Files
+- Use the school-style `schoolUserId`, not the Mongo `_id`.
+- The response already contains full exercise data inline, so no extra call is
+  needed. It can be over 1 MB.
+- Save a response to a file and replay it offline with `--from-json FILE`.
 
-KaTeX CSS references ~60 font files (woff2, ttf, woff). For Chrome headless PDF to render formulas correctly, these must be available locally. `render_katex.js` handles this automatically by downloading fonts to `$TMPDIR/katex-fonts/` and rewriting CSS paths to `file:///` URLs.
+## Homework selection
 
-## PDF Export: Chrome Headless
+1. Flatten `data.courseHomeworkDTOList[].studentCourseHomeworkDTOList[]`.
+2. Keep items with `submission_status == "not_submitted"` (snake_case is more
+   reliable than `submissionStatus`) or `status == 0`.
+3. Sort by `endTime` descending. Return all of them.
+
+The API may only list courses that have homework. Always report
+`courses_checked` so the user can spot a missing course.
+
+## Question extraction order (per exercise)
+
+1. Every `questionStructure[]` entry:
+   - `mainQuestion.questionMd`: main text (keeps LaTeX)
+   - `subQuestions[].questionMd`: rendered separately as (1), (2), ...
+     Dropping sub-questions loses data without any warning.
+2. Fallback: `questions[].content` (plain text, may lose formatting)
+3. Last resort: `exercise.name`
+
+Header fields: `exercise.questionNum`, `exercise.score`.
+
+## Rendering pipeline
+
+1. Split each question into text and math segments. Supported delimiters:
+   `$$..$$`, `\[..\]` (display), `$..$`, `\(..\)` (inline). `\$` is a literal dollar sign.
+2. HTML-escape **text segments only**. Question text contains raw `<`/`>`
+   (e.g. `$P\{1<X<3\}$`). Unescaped text gets truncated by the browser.
+   Escaped TeX (`&lt;`) makes KaTeX fail to parse. So escape the text, and give
+   KaTeX the raw TeX (its output is already safe HTML).
+3. Send all formulas of a homework in one batch to `scripts/render_katex.js`
+   (`{"formulas":[{"tex","display"}]}` on stdin, `{"html":[...],"css"}` on stdout).
+4. The CSS comes from `node_modules/katex/dist/katex.min.css`, with font URLs
+   rewritten to `file://` paths in `node_modules/katex/dist/fonts`, so nothing
+   is downloaded at render time.
+5. The resulting HTML contains no JavaScript. One exercise per page, with answer space.
+
+### Why server-side
+
+Chrome headless `--print-to-pdf` does not execute page JavaScript.
+`--virtual-time-budget`, `--headless=new` and CDP `Page.printToPDF` after a wait
+were all tried, and none of them fix it. Browser-side `renderMathInElement`
+leaves raw `$...$` in the PDF.
+
+## PDF export
 
 ```bash
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-  --headless --disable-gpu \
-  --print-to-pdf=/tmp/output.pdf \
-  --print-to-pdf-no-header \
-  "file:///path/to/prerendered.html"
+  --headless --disable-gpu --no-pdf-header-footer \
+  --print-to-pdf=/tmp/output.pdf "file:///path/to/prerendered.html"
 ```
 
-**The input MUST be the server-side pre-rendered HTML, not the browser-side KaTeX HTML.**
+- Do **not** add a fresh `--user-data-dir` on macOS. Chrome writes the PDF but
+  then never exits.
+- The script deletes any old PDF first and checks that the new file starts with `%PDF-`.
 
-**Verification checklist:**
-- Output file size > 50KB (not empty)
-- Formula count > 0 (check `class="katex"` occurrences in the HTML before PDF)
-- No raw `$...$` or `\(...\)` visible in PDF
-- Regenerate PDF after any HTML change — don't send a stale PDF
+## Verification checklist
+
+- `formula_count` in the summary > 0 for math homework
+- no `katex-error` in the HTML (`grep -c katex-error file.html`)
+- PDF regenerated in this run (check `pdf_size` / mtime)
