@@ -6,9 +6,10 @@ description: Export unsubmitted homework from smartestu.cn (数你最灵) to a p
 # Smartestu Homework Export
 
 Use the bundled script. It talks to the Smartestu API directly (no browser
-scraping), renders formulas server-side with KaTeX, and prints PDFs with Chrome
-headless. Chrome's `--print-to-pdf` does not run page JavaScript, so never
-switch to browser-side KaTeX.
+scraping), follows the current cookie/CSRF and paginated homework workflow,
+renders formulas server-side with KaTeX, and prints PDFs with Chrome headless.
+Chrome's `--print-to-pdf` does not run page JavaScript, so never switch to
+browser-side KaTeX.
 
 ## Prerequisites (once)
 

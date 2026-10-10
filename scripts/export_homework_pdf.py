@@ -2,11 +2,12 @@
 """Export unsubmitted homework from smartestu.cn (数你最灵) as KaTeX-rendered PDFs.
 
 Pipeline:
-  1. API: resolve school code -> login -> query homeworks -> pick unsubmitted
-  2. Extract questions (questionStructure main/sub questions, with fallbacks)
-  3. Render formulas server-side with Node.js KaTeX (scripts/render_katex.js)
+  1. API: resolve school -> cookie login -> session courses -> paginated homework list
+  2. Pick unsubmitted homework and fetch each assignment's exercise details
+  3. Extract questions (questionStructure main/sub questions, with fallbacks)
+  4. Render formulas server-side with Node.js KaTeX (scripts/render_katex.js)
      and build a self-contained HTML file (no JavaScript)
-  4. Print the HTML to PDF with Chrome/Chromium headless
+  5. Print the HTML to PDF with Chrome/Chromium headless
 
 Chrome headless --print-to-pdf does NOT execute page JavaScript, so all KaTeX
 rendering happens before the HTML is written.
@@ -41,8 +42,11 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 BASE_URL = 'https://smartestu.cn'
 SCHOOLS_API = BASE_URL + '/api/schools'
 LOGIN_API = BASE_URL + '/api/auth/login'
+AUTH_SESSION_API = BASE_URL + '/api/auth/session'
 QUERY_HOMEWORKS_API = BASE_URL + '/api/homework/student/mark/queryHomeworks'
+QUERY_EXERCISES_API = BASE_URL + '/api/homework/student/mark/queryExercisesByHomeworkId'
 KEYCHAIN_SERVICE = 'smartestu.cn'
+HOMEWORK_PAGE_SIZE = 100
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RENDER_SCRIPT = Path(__file__).resolve().parent / 'render_katex.js'
@@ -73,9 +77,12 @@ Renderer = Callable[[List[Tuple[str, bool]]], Tuple[List[str], str]]
 class ExportError(Exception):
     """An expected failure that maps to a specific exit code."""
 
-    def __init__(self, message: str, exit_code: int = EXIT_ERROR):
+    def __init__(self, message: str, exit_code: int = EXIT_ERROR,
+                 status_code: Optional[int] = None, url: Optional[str] = None):
         super().__init__(message)
         self.exit_code = exit_code
+        self.status_code = status_code
+        self.url = url
 
 
 # ---------------------------------------------------------------------------
@@ -366,32 +373,190 @@ def _request_json(session, method: str, url: str, verify: bool, timeout: int, **
     except requests.RequestException as exc:
         raise ExportError('Network error calling %s: %s' % (url, exc), EXIT_API)
     if resp.status_code in (401, 403):
-        raise ExportError('Authentication failed (HTTP %d) at %s' % (resp.status_code, url), EXIT_API)
+        raise ExportError('Authentication failed (HTTP %d) at %s' % (resp.status_code, url),
+                          EXIT_API, resp.status_code, url)
     if resp.status_code >= 400:
-        raise ExportError('HTTP %d from %s' % (resp.status_code, url), EXIT_API)
+        detail = ''
+        try:
+            body = resp.json()
+            if isinstance(body, dict):
+                detail = body.get('message') or body.get('code') or ''
+        except ValueError:
+            pass
+        suffix = ': %s' % detail if detail else ''
+        raise ExportError('HTTP %d from %s%s' % (resp.status_code, url, suffix),
+                          EXIT_API, resp.status_code, url)
     try:
         return resp.json()
     except ValueError:
         raise ExportError('Non-JSON response from %s' % url, EXIT_API)
 
 
-def fetch_unsubmitted(session, school: Optional[str], school_code: Optional[str],
-                      student_id: str, password: str, verify: bool = True):
-    """Run the API workflow. Returns (school_code, unsubmitted, courses)."""
-    if not school_code:
-        schools = parse_schools(_request_json(session, 'GET', SCHOOLS_API, verify, 30))
-        school_code = find_school_code(schools, school or '')
+def _student_courses(session_response: Any) -> List[Dict[str, Any]]:
+    """Return validated student courses from /api/auth/session."""
+    if not isinstance(session_response, dict):
+        raise ExportError('Unexpected /api/auth/session response shape', EXIT_API)
+    user = session_response.get('user')
+    profile = user.get('capabilityProfile') if isinstance(user, dict) else None
+    courses = profile.get('studentCourses') if isinstance(profile, dict) else None
+    if not isinstance(courses, list):
+        raise ExportError('/api/auth/session has no student course list', EXIT_API)
+    for course in courses:
+        if not isinstance(course, dict) or course.get('courseId') in (None, ''):
+            raise ExportError('/api/auth/session contains a student course without courseId',
+                              EXIT_API)
+    return courses
+
+
+def _merge_homework_pages(pages: Sequence[Any],
+                          session_courses: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Merge paginated courseHomeworkDTOList values, retaining empty courses."""
+    merged = {}
+    order = []
+
+    def add_course(course: Dict[str, Any]) -> None:
+        course_id = course.get('courseId')
+        key = ('id', str(course_id)) if course_id is not None else ('name', course.get('courseName'))
+        if key not in merged:
+            merged[key] = {
+                'courseId': course_id,
+                'courseName': course.get('courseName') or '?',
+                'studentCourseHomeworkDTOList': [],
+            }
+            order.append(key)
+        elif course.get('courseName'):
+            merged[key]['courseName'] = course['courseName']
+        items = course.get('studentCourseHomeworkDTOList') or []
+        if isinstance(items, list):
+            merged[key]['studentCourseHomeworkDTOList'].extend(
+                item for item in items if isinstance(item, dict))
+
+    for course in session_courses:
+        add_course(course)
+    for response in pages:
+        payload = response.get('data') if isinstance(response, dict) else None
+        course_list = payload.get('courseHomeworkDTOList') if isinstance(payload, dict) else None
+        if not isinstance(course_list, list):
+            raise ExportError('Unexpected paginated queryHomeworks response shape', EXIT_API)
+        for course in course_list:
+            if isinstance(course, dict):
+                add_course(course)
+    return {'data': {'courseHomeworkDTOList': [merged[key] for key in order]}}
+
+
+def _query_legacy_homeworks(session, school_user_id: str, token: str,
+                            verify: bool) -> Any:
+    return _request_json(session, 'POST', QUERY_HOMEWORKS_API, verify, 120,
+                         headers={'Authorization': 'Bearer ' + token},
+                         json={'studentId': school_user_id})
+
+
+def _fetch_unsubmitted_cookie_session(session, school_code: str, student_id: str,
+                                      password: str, verify: bool = True,
+                                      latest_only: bool = False):
+    """Use the current Smartestu cookie-v1 login, pagination and detail APIs."""
+    protocol_headers = {'X-Auth-Protocol': 'cookie-v1'}
     school_user_id = '%s-%s' % (school_code, student_id)
-    login_resp = _request_json(session, 'POST', LOGIN_API, verify, 30, json={
+    login_payload = {
         'schoolCode': school_code,
         'schoolUserLocalId': student_id,
         'schoolUserId': school_user_id,
         'password': password,
-    })
-    token = extract_token(login_resp)
-    data = _request_json(session, 'POST', QUERY_HOMEWORKS_API, verify, 120,
-                         headers={'Authorization': 'Bearer ' + token},
-                         json={'studentId': school_user_id})
+    }
+    try:
+        login_resp = _request_json(session, 'POST', LOGIN_API, verify, 30,
+                                   headers=protocol_headers, json=login_payload)
+    except ExportError as exc:
+        # Only an explicit protocol-upgrade response from the login endpoint may
+        # trigger a second credential submission through the legacy flow.
+        if exc.status_code != 426 or exc.url != LOGIN_API:
+            raise
+        legacy_login = _request_json(session, 'POST', LOGIN_API, verify, 30,
+                                     json=login_payload)
+        return _query_legacy_homeworks(session, school_user_id,
+                                       extract_token(legacy_login), verify)
+
+    # Prefer cookie-v1 on transitional responses that expose both mechanisms.
+    # A token-only response is a legacy deployment and can be queried directly.
+    session_context = login_resp.get('sessionContext') if isinstance(login_resp, dict) else None
+    if not session_context:
+        return _query_legacy_homeworks(session, school_user_id,
+                                       extract_token(login_resp), verify)
+
+    # The auth cookie is held by requests.Session. Fetch the current context,
+    # CSRF token and complete student enrollment from /auth/session.
+    session_headers = {
+        'X-Auth-Protocol': 'cookie-v1',
+        'X-Session-Context': session_context,
+    }
+    session_resp = _request_json(session, 'GET', AUTH_SESSION_API, verify, 30,
+                                 headers=session_headers)
+    csrf_token = session_resp.get('csrfToken') if isinstance(session_resp, dict) else None
+    current_context = session_resp.get('sessionContext') if isinstance(session_resp, dict) else None
+    query_headers = {
+        'X-Auth-Protocol': 'cookie-v1',
+        'X-Session-Context': current_context or session_context,
+    }
+    if csrf_token:
+        query_headers['X-CSRF-Token'] = csrf_token
+
+    courses = _student_courses(session_resp)
+    course_ids = [course['courseId'] for course in courses]
+    if not course_ids:
+        return _merge_homework_pages([], courses)
+
+    pages = []
+    page_no = 1
+    while True:
+        response = _request_json(session, 'POST', QUERY_HOMEWORKS_API, verify, 120,
+                                 headers=query_headers, json={
+                                     'courseIds': course_ids,
+                                     'scene': 'homework',
+                                     'pageNo': page_no,
+                                     'pageSize': HOMEWORK_PAGE_SIZE,
+                                 })
+        pages.append(response)
+        payload = response.get('data') if isinstance(response, dict) else None
+        if not isinstance(payload, dict):
+            raise ExportError('queryHomeworks response has no "data" object', EXIT_API)
+        try:
+            page_total = int(payload.get('pageTotal') or 0)
+        except (TypeError, ValueError):
+            raise ExportError('queryHomeworks response has invalid pageTotal', EXIT_API)
+        if page_no >= max(page_total, 1):
+            break
+        page_no += 1
+
+    data = _merge_homework_pages(pages, courses)
+    course_list = data['data']['courseHomeworkDTOList']
+    homeworks = [homework for course in course_list
+                 for homework in course['studentCourseHomeworkDTOList']]
+    selected = select_unsubmitted(homeworks)
+    if latest_only:
+        selected = selected[:1]
+    for homework in selected:
+        homework_id = homework.get('id')
+        if homework_id is None:
+            raise ExportError('Unsubmitted homework has no id', EXIT_API)
+        detail = _request_json(session, 'POST', QUERY_EXERCISES_API, verify, 120,
+                               headers=query_headers, json={'homeworkId': homework_id})
+        payload = detail.get('data') if isinstance(detail, dict) else None
+        exercises = payload.get('exercises') if isinstance(payload, dict) else None
+        if not isinstance(exercises, list):
+            raise ExportError('Unexpected queryExercisesByHomeworkId response shape', EXIT_API)
+        homework['exercises'] = exercises
+    return data
+
+
+def fetch_unsubmitted(session, school: Optional[str], school_code: Optional[str],
+                      student_id: str, password: str, verify: bool = True,
+                      latest_only: bool = False):
+    """Run the API workflow. Returns (school_code, unsubmitted, courses)."""
+    if not school_code:
+        schools = parse_schools(_request_json(session, 'GET', SCHOOLS_API, verify, 30))
+        school_code = find_school_code(schools, school or '')
+    data = _fetch_unsubmitted_cookie_session(session, school_code, student_id,
+                                             password, verify, latest_only)
     homeworks, courses = flatten_homeworks(data)
     return school_code, select_unsubmitted(homeworks), courses
 
@@ -477,6 +642,31 @@ def find_chrome(explicit: Optional[str] = None, environ=None) -> Optional[str]:
     return None
 
 
+def _ensure_output_dir(path: Path) -> None:
+    """Create a private output directory or validate an existing real directory."""
+    try:
+        path.mkdir(parents=True, mode=0o700)
+    except FileExistsError:
+        if path.is_symlink() or not path.is_dir():
+            raise ExportError('--out-dir must be a directory, not a symlink: %s' % path,
+                              EXIT_USAGE)
+
+
+def _write_private_text(path: Path, content: str) -> None:
+    """Write UTF-8 text with owner-only permissions, including on replacement."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
+    fd = os.open(str(path), flags, 0o600)
+    try:
+        if hasattr(os, 'fchmod'):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            fd = -1
+            fh.write(content)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def export_pdf(chrome: str, html_path: Path, pdf_path: Path, timeout: int = 120) -> None:
     """Print pre-rendered HTML to PDF and verify a fresh, valid PDF was written."""
     if pdf_path.exists():
@@ -492,6 +682,8 @@ def export_pdf(chrome: str, html_path: Path, pdf_path: Path, timeout: int = 120)
     if not pdf_path.exists() or pdf_path.stat().st_size == 0:
         raise ExportError('Chrome did not produce %s: %s' % (pdf_path, result.stderr.strip()[-500:]),
                           EXIT_PDF)
+    if hasattr(os, 'chmod'):
+        os.chmod(pdf_path, 0o600)
     with pdf_path.open('rb') as fh:
         if fh.read(5) != b'%PDF-':
             raise ExportError('%s is not a valid PDF' % pdf_path, EXIT_PDF)
@@ -513,7 +705,8 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument('--school-code', help='School code; skips the /api/schools lookup')
     src.add_argument('--student-id', help='Student local id (without the school prefix)')
     src.add_argument('--from-json', type=Path, metavar='FILE',
-                     help='Offline mode: read a saved queryHomeworks response instead of logging in')
+                     help='Offline mode: read a saved queryHomeworks response whose homework '
+                          'entries include exercises')
     pw = p.add_argument_group('password (first match wins)')
     pw.add_argument('--password-stdin', action='store_true', help='Read the password from stdin')
     pw.add_argument('--keychain', action='store_true',
@@ -557,7 +750,7 @@ def run(args: argparse.Namespace, session=None, renderer: Optional[Renderer] = N
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         school_code, unsubmitted, courses = fetch_unsubmitted(
             session, args.school_name, args.school_code, args.student_id, password,
-            verify=not args.insecure)
+            verify=not args.insecure, latest_only=args.latest_only)
 
     summary = {
         'status': 'ok' if unsubmitted else 'no_unsubmitted',
@@ -567,12 +760,14 @@ def run(args: argparse.Namespace, session=None, renderer: Optional[Renderer] = N
         'generated_at': datetime.now().isoformat(timespec='seconds'),
         'homeworks': [],
     }
+    _ensure_output_dir(args.out_dir)
     if not unsubmitted:
+        _write_private_text(args.out_dir / 'summary.json',
+                            json.dumps(summary, ensure_ascii=False, indent=2))
         return summary
     if args.latest_only:
         unsubmitted = unsubmitted[:1]
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
     if renderer is None:
         ensure_katex_installed(install=not args.no_install)
         renderer = make_node_renderer(args.node)
@@ -593,7 +788,7 @@ def run(args: argparse.Namespace, session=None, renderer: Optional[Renderer] = N
         meta = ' · '.join(x for x in (str(hw.get('courseName') or ''),
                                       ('截止 %s' % hw['endTime']) if hw.get('endTime') else '') if x)
         doc, formula_count = build_homework_html(name, exercises, renderer, meta=meta)
-        html_path.write_text(doc, encoding='utf-8')
+        _write_private_text(html_path, doc)
         if chrome:
             export_pdf(chrome, html_path, pdf_path)
         summary['homeworks'].append({
@@ -607,8 +802,8 @@ def run(args: argparse.Namespace, session=None, renderer: Optional[Renderer] = N
             'pdf_size': pdf_path.stat().st_size if chrome else None,
         })
 
-    (args.out_dir / 'summary.json').write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+    _write_private_text(args.out_dir / 'summary.json',
+                        json.dumps(summary, ensure_ascii=False, indent=2))
     return summary
 
 

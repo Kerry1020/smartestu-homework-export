@@ -276,6 +276,145 @@ def test_fetch_unsubmitted_payloads():
     assert query_kw['headers']['Authorization'] == 'Bearer T'
 
 
+class CookieSession:
+    def __init__(self, login=None, courses=None, homeworks=None):
+        self.calls = []
+        self.login = login if login is not None else {'sessionContext': 'LOGIN-CONTEXT'}
+        self.courses = courses if courses is not None else [
+            {'courseId': 10, 'courseName': '概率论'},
+            {'courseId': 20, 'courseName': '线代'},
+            {'courseId': 30, 'courseName': '空课'},
+        ]
+        self.homeworks = homeworks
+
+    def request(self, method, url, **kw):
+        self.calls.append((method, url, kw))
+        if url == ehp.LOGIN_API:
+            return FakeResp(self.login)
+        if url == ehp.AUTH_SESSION_API:
+            return FakeResp({
+                'sessionContext': 'CURRENT-CONTEXT',
+                'csrfToken': 'CSRF',
+                'user': {'capabilityProfile': {'studentCourses': self.courses}},
+            })
+        if url == ehp.QUERY_HOMEWORKS_API:
+            if self.homeworks is not None:
+                return FakeResp({'data': {'courseHomeworkDTOList': self.homeworks,
+                                          'pageNo': 1, 'pageTotal': 1}})
+            page = kw['json']['pageNo']
+            courses = ([
+                {'courseId': 10, 'courseName': '概率论', 'studentCourseHomeworkDTOList': [
+                    {'id': 101, 'name': 'hw1', 'submission_status': 'not_submitted',
+                     'endTime': '2026-03-01'},
+                ]},
+            ] if page == 1 else [
+                {'courseId': 20, 'courseName': '线代', 'studentCourseHomeworkDTOList': [
+                    {'id': 202, 'name': 'hw2', 'status': 1, 'endTime': '2026-04-01'},
+                ]},
+            ])
+            return FakeResp({'data': {'courseHomeworkDTOList': courses,
+                                      'pageNo': page, 'pageTotal': 2}})
+        if url == ehp.QUERY_EXERCISES_API:
+            return FakeResp({'data': {'exercises': [{'name': 'question'}]}})
+        raise AssertionError(url)
+
+
+def test_fetch_unsubmitted_cookie_session_uses_courses_pages_and_details():
+    s = CookieSession()
+    code, unsub, courses = ehp.fetch_unsubmitted(s, None, 'sl', '123', 'pw')
+    assert code == 'sl'
+    assert courses == ['概率论', '线代', '空课']
+    assert [(hw['name'], hw['courseName']) for hw in unsub] == [('hw1', '概率论')]
+    assert unsub[0]['exercises'] == [{'name': 'question'}]
+
+    _, _, login_kw = s.calls[0]
+    assert login_kw['headers'] == {'X-Auth-Protocol': 'cookie-v1'}
+    assert login_kw['json']['schoolUserId'] == 'sl-123'
+    _, _, session_kw = s.calls[1]
+    assert session_kw['headers']['X-Session-Context'] == 'LOGIN-CONTEXT'
+
+    homework_calls = [call for call in s.calls if call[1] == ehp.QUERY_HOMEWORKS_API]
+    assert [call[2]['json']['pageNo'] for call in homework_calls] == [1, 2]
+    for _, _, query_kw in homework_calls:
+        assert query_kw['json']['courseIds'] == [10, 20, 30]
+        assert query_kw['json']['scene'] == 'homework'
+        assert query_kw['json']['pageSize'] == ehp.HOMEWORK_PAGE_SIZE
+        assert query_kw['headers']['X-Auth-Protocol'] == 'cookie-v1'
+        assert query_kw['headers']['X-Session-Context'] == 'CURRENT-CONTEXT'
+        assert query_kw['headers']['X-CSRF-Token'] == 'CSRF'
+
+
+def test_cookie_session_rejects_course_without_id():
+    s = CookieSession(courses=[{'courseName': '坏数据'}])
+    with pytest.raises(ExportError, match='without courseId'):
+        ehp.fetch_unsubmitted(s, None, 'sl', '123', 'pw')
+    assert not any(url == ehp.QUERY_HOMEWORKS_API for _, url, _ in s.calls)
+
+
+def test_cookie_session_prefers_context_when_login_also_has_token():
+    s = CookieSession(login={'sessionContext': 'LOGIN-CONTEXT', 'token': 'LEGACY'})
+    ehp.fetch_unsubmitted(s, None, 'sl', '123', 'pw')
+    assert any(url == ehp.AUTH_SESSION_API for _, url, _ in s.calls)
+    queries = [kw for _, url, kw in s.calls if url == ehp.QUERY_HOMEWORKS_API]
+    assert queries and all('Authorization' not in kw['headers'] for kw in queries)
+
+
+def test_latest_only_fetches_only_latest_detail():
+    homeworks = [{
+        'courseId': 10,
+        'courseName': '概率论',
+        'studentCourseHomeworkDTOList': [
+            {'id': 101, 'name': 'latest', 'status': 0, 'endTime': '2026-05-01'},
+            {'name': 'older-without-id', 'status': 0, 'endTime': '2026-04-01'},
+        ],
+    }]
+    s = CookieSession(homeworks=homeworks)
+    _, unsubmitted, _ = ehp.fetch_unsubmitted(
+        s, None, 'sl', '123', 'pw', latest_only=True)
+    assert len(unsubmitted) == 2
+    assert unsubmitted[0]['exercises'] == [{'name': 'question'}]
+    assert 'exercises' not in unsubmitted[1]
+    details = [kw['json'] for _, url, kw in s.calls if url == ehp.QUERY_EXERCISES_API]
+    assert details == [{'homeworkId': 101}]
+
+
+def test_426_fallback_only_applies_to_cookie_login():
+    class Login426Session(FakeSession):
+        def __init__(self):
+            super().__init__()
+            self.logins = 0
+
+        def request(self, method, url, **kw):
+            self.calls.append((method, url, kw))
+            if url == ehp.LOGIN_API:
+                self.logins += 1
+                return FakeResp({'code': 'AUTH_CLIENT_UPDATE_REQUIRED'}, 426) \
+                    if self.logins == 1 else FakeResp({'token': 'T'})
+            if url == ehp.QUERY_HOMEWORKS_API:
+                return FakeResp(homework_response())
+            raise AssertionError(url)
+
+    s = Login426Session()
+    _, unsub, _ = ehp.fetch_unsubmitted(s, None, 'sl', '123', 'pw')
+    assert len(unsub) == 3 and s.logins == 2
+    assert 'headers' not in s.calls[1][2]
+
+
+def test_426_from_non_login_request_does_not_retry_credentials():
+    class Query426Session(CookieSession):
+        def request(self, method, url, **kw):
+            if url == ehp.QUERY_HOMEWORKS_API:
+                self.calls.append((method, url, kw))
+                return FakeResp({'message': 'upgrade'}, 426)
+            return super().request(method, url, **kw)
+
+    s = Query426Session()
+    with pytest.raises(ExportError) as error:
+        ehp.fetch_unsubmitted(s, None, 'sl', '123', 'pw')
+    assert error.value.status_code == 426
+    assert len([call for call in s.calls if call[1] == ehp.LOGIN_API]) == 1
+
+
 def test_run_writes_html_and_summary(tmp_path):
     summary = ehp.run(cli_args(tmp_path), session=FakeSession(), renderer=fake_renderer())
     assert summary['status'] == 'ok' and summary['unsubmitted_count'] == 3
@@ -290,13 +429,52 @@ def test_run_latest_only(tmp_path):
     assert [h['homework_name'] for h in summary['homeworks']] == ['hw3']
 
 
-def test_run_from_json_offline(tmp_path):
+def test_output_dir_preserves_existing_permissions(tmp_path):
+    out_dir = tmp_path / 'shared'
+    out_dir.mkdir(mode=0o755)
+    ehp._ensure_output_dir(out_dir)
+    assert out_dir.stat().st_mode & 0o777 == 0o755
+
+
+def test_output_dir_rejects_symlink(tmp_path):
+    target = tmp_path / 'target'
+    target.mkdir()
+    link = tmp_path / 'link'
+    link.symlink_to(target, target_is_directory=True)
+    with pytest.raises(ExportError, match='not a symlink'):
+        ehp._ensure_output_dir(link)
+
+
+def test_run_no_unsubmitted_writes_private_summary(tmp_path):
+    response = {'data': {'courseHomeworkDTOList': [
+        {'courseName': '空课', 'studentCourseHomeworkDTOList': []},
+    ]}}
+    src = tmp_path / 'response.json'
+    out_dir = tmp_path / 'output'
+    src.write_text(json.dumps(response), encoding='utf-8')
+    args = ehp.build_parser().parse_args(
+        ['--from-json', str(src), '--out-dir', str(out_dir), '--no-pdf'])
+    summary = ehp.run(args, renderer=fake_renderer())
+    summary_path = out_dir / 'summary.json'
+    saved = json.loads(summary_path.read_text(encoding='utf-8'))
+    assert summary['status'] == 'no_unsubmitted'
+    assert saved == summary
+    assert summary_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_run_from_json_offline_renders_saved_exercises(tmp_path):
+    response = homework_response()
+    response['data']['courseHomeworkDTOList'][1]['studentCourseHomeworkDTOList'][0][
+        'exercises'] = [{'name': 'saved question'}]
     src = tmp_path / 'resp.json'
-    src.write_text(json.dumps(homework_response()), encoding='utf-8')
+    src.write_text(json.dumps(response), encoding='utf-8')
     args = ehp.build_parser().parse_args(['--from-json', str(src), '--out-dir', str(tmp_path / 'o'),
                                           '--no-pdf'])
     summary = ehp.run(args, renderer=fake_renderer())
     assert summary['unsubmitted_count'] == 3
+    html_text = Path(summary['homeworks'][0]['html']).read_text(encoding='utf-8')
+    assert 'saved question' in html_text
+    assert Path(summary['homeworks'][0]['html']).stat().st_mode & 0o777 == 0o600
 
 
 def test_main_exit_codes(tmp_path, monkeypatch, capsys):

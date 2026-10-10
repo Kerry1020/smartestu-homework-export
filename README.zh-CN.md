@@ -11,11 +11,13 @@
 ## 功能特性
 
 - 直接调用 Smartestu API，不靠浏览器抓页面
+- 使用当前 cookie/CSRF 会话协议，同时兼容旧版 bearer token 响应
+- 读取当前学生的课程，遍历分页作业结果，并为每份未提交作业获取题目详情
 - 列出全部未提交作业，按截止时间从晚到早排列，并附上检查过的课程列表
 - 按原顺序导出主问题和子问题
 - 打印前先渲染好 KaTeX 公式，HTML 里不含 JavaScript，Chrome headless 也能正确打印公式
 - 每题下方留出 A4 作答空间
-- 离线模式：不登录，直接渲染之前保存的 `queryHomeworks` 响应
+- 离线模式：不登录，直接渲染之前保存的、包含题目详情的 `queryHomeworks` 响应
 
 本工具不是通用的 LMS 爬虫，也不会替你提交任何内容。
 
@@ -59,7 +61,7 @@ security add-generic-password -a "<student_id>" -s "smartestu.cn" -w
 | `--school-name NAME` | 学校名称，与 `/api/schools` 中的一致（如中文校名） |
 | `--school-code CODE` | 跳过按学校名称查询 |
 | `--student-id ID` | 学号，不带学校前缀 |
-| `--from-json FILE` | 离线模式：不登录，渲染之前保存的 `queryHomeworks` 响应 |
+| `--from-json FILE` | 离线模式：渲染之前保存的、包含题目详情的 `queryHomeworks` 响应 |
 | `--password-stdin` / `--keychain` / `--password PW` | 密码来源（见上文） |
 | `--out-dir DIR` | 输出目录（默认 `$TMPDIR/smartestu-export`） |
 | `--latest-only` | 只导出截止时间最晚的一份作业 |
@@ -69,7 +71,7 @@ security add-generic-password -a "<student_id>" -s "smartestu.cn" -w
 | `--no-install` | 缺少 katex 时不自动运行 `npm ci` |
 | `--insecure` | 关闭 TLS 证书校验（一般用不到） |
 
-输出：每份作业生成一个 `<作业名>.html` 和一个 `<作业名>.pdf`，另有一个 `summary.json`，内容同时打印到 stdout。
+输出：每份作业生成一个 `<作业名>.html` 和一个 `<作业名>.pdf`，另有一个 `summary.json`，内容同时打印到 stdout。在支持 POSIX 权限的平台上，生成文件仅允许当前用户访问。
 
 退出码：`0` 成功（包括“没有未提交作业”）；`1` 未预期的错误；`2` 参数错误、找不到学校、缺少密码或输入文件读不了；`3` 网络、登录或 API 错误；`4` KaTeX 渲染失败；`5` PDF 导出失败；`130` 被中断。
 
@@ -92,7 +94,7 @@ security add-generic-password -a "<student_id>" -s "smartestu.cn" -w
 | `Chrome/Chromium not found` / 退出码 5 | 安装 Chrome，或用 `--chrome` / `CHROME_PATH` 指定路径；也可以用 `--no-pdf` |
 | Chrome 超时 | 关掉 Chrome 弹出的配置对话框后重试；不要自己加 `--user-data-dir`（在 macOS 上会让 Chrome 卡住） |
 | PDF 里出现红色公式 | 说明题目源数据里这条 TeX 本身有错，可以用 `grep katex-error *.html` 定位 |
-| 显示 0 份未提交，但实际应该有 | 看一下 `courses_checked`：API 只返回在平台上布置过作业的课程 |
+| 显示 0 份未提交，但实际应该有 | 新版 cookie-v1 流程中请检查 `courses_checked`：它来自当前账号的学生课程列表，缺少课程通常说明账号或选课信息异常；旧版 bearer 响应可能只列出作业接口返回的课程 |
 
 ## 隐私
 
