@@ -13,11 +13,13 @@ printable PDFs, one question per page, with math rendered by KaTeX.
 ## Features
 
 - Uses the Smartestu API directly instead of scraping pages in a browser
+- Uses the current cookie/CSRF session protocol, while retaining compatibility with legacy bearer-token responses
+- Reads the authenticated student's courses, follows paginated homework results, and fetches exercise details for each unsubmitted assignment
 - Reports every unsubmitted assignment, newest deadline first, plus the list of courses it checked
 - Includes main questions and sub-questions in their original order
 - Renders KaTeX formulas before printing, so the HTML needs no JavaScript and Chrome headless prints the math correctly
 - Leaves A4 answer space under each question
-- Offline mode: render a saved `queryHomeworks` response without logging in
+- Offline mode: render a saved `queryHomeworks` response that includes exercise data without logging in
 
 It is not a general-purpose LMS scraper and does not submit anything.
 
@@ -66,7 +68,7 @@ Options:
 | `--school-name NAME` | school name as listed by `/api/schools` (e.g. the Chinese name) |
 | `--school-code CODE` | skip the school-name lookup |
 | `--student-id ID` | student id without the school prefix |
-| `--from-json FILE` | offline: render a saved `queryHomeworks` response instead of logging in |
+| `--from-json FILE` | offline: render a saved `queryHomeworks` response that includes exercise data |
 | `--password-stdin` / `--keychain` / `--password PW` | password source (see above) |
 | `--out-dir DIR` | output directory (default: `$TMPDIR/smartestu-export`) |
 | `--latest-only` | export only the homework with the latest deadline |
@@ -77,7 +79,8 @@ Options:
 | `--insecure` | disable TLS verification (not normally needed) |
 
 Output: one `<homework>.html` and one `<homework>.pdf` per assignment, plus a
-`summary.json` file. The same summary is printed to stdout.
+`summary.json` file. The same summary is printed to stdout. Generated files use
+owner-only permissions on platforms that support POSIX modes.
 
 Exit codes: `0` ok (including "no unsubmitted homework"), `1` unexpected
 error, `2` usage / school not found / no password / unreadable input file,
@@ -103,7 +106,7 @@ Keychain item (for `--keychain`): service `smartestu.cn`, account = student id.
 | `Chrome/Chromium not found` / exit 5 | install Chrome, or pass `--chrome` / set `CHROME_PATH`; or use `--no-pdf` |
 | Chrome timeout | close any Chrome profile dialogs and try again; never add a custom `--user-data-dir` (Chrome hangs on macOS) |
 | red formula text in the PDF | that formula is invalid TeX in the source; `grep katex-error *.html` finds it |
-| `0 unsubmitted` but you expected some | look at `courses_checked`: the API only lists courses that have homework on the platform |
+| `0 unsubmitted` but you expected some | on the current cookie-v1 flow, inspect `courses_checked`: it comes from the authenticated student's enrollment list, so a missing course indicates an account/enrollment issue; legacy bearer responses may list only courses returned by the homework API |
 
 ## Privacy
 
